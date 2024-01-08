@@ -1,23 +1,19 @@
 from os.path import join, dirname
 
-from ovos_plugin_common_play.ocp import MediaType, PlaybackType
-from ovos_utils.parse import fuzzy_match, MatchStrategy
-from ovos_workshop.skills.common_play import OVOSCommonPlaybackSkill, \
-    ocp_search, ocp_featured_media
 from reddit_movies import RedditMovies
+
+from ovos_utils.ocp import MediaType, PlaybackType
+from ovos_workshop.decorators.ocp import ocp_search, ocp_featured_media
+from ovos_workshop.skills.common_play import OVOSCommonPlaybackSkill
 
 
 class RedditMoviesSkill(OVOSCommonPlaybackSkill):
-
-    def __init__(self):
-        super().__init__("RedditMovies")
-        self.skill_icon = join(dirname(__file__), "ui",
-                               "documentaries_icon.png")
-        self.supported_media = [MediaType.MOVIE,
-                                MediaType.GENERIC,
-                                MediaType.VIDEO]
+    def __init__(self, *args, **kwargs):
+        self.skill_icon = join(dirname(__file__), "ui", "logo.png")
+        self.supported_media = [MediaType.MOVIE]
 
         self.reddit = RedditMovies()
+        super().__init__(*args, **kwargs)
 
     def initialize(self):
         # get your own keys! these might stop working any time
@@ -32,54 +28,73 @@ class RedditMoviesSkill(OVOSCommonPlaybackSkill):
                 client=self.settings["praw_client"],
                 secret=self.settings["praw_secret"])
 
-        self.schedule_event(self._scrap_reddit, 1)
+        self._scrap_reddit()
+        self.register_ocp_keyword(MediaType.MOVIE,
+                                  "movie_streaming_provider",
+                                  ["Reddit Movies", "Reddit"])
 
     def _scrap_reddit(self, message=None):
-        for v in self.reddit.scrap():
-            pass  # TODO Some validation ?
+        movies = []
+        for v in self.reddit.get_cached_entries():
+            t = v["title"].split(" (")[0].replace("COMPLETE", "")
+            if '"' in t:
+                t = t.split('"')[1]
+            movies.append(t.strip())
+        try:
+            for v in self.reddit.scrap():
+                t = v["title"].split(" (")[0].replace("COMPLETE", "")
+                if '"' in t:
+                    t = t.split('"')[1]
+                movies.append(t.strip())
+        except:
+            pass
+        self.register_ocp_keyword(MediaType.MOVIE,
+                                  "movie_name", movies)
         self.schedule_event(self._scrap_reddit, 3600)  # repeat every hour
-
-    def calc_score(self, phrase, match, base_score=0):
-        # check for forbidden words in title
-        if self.voc_match(match["title"].lower(), "blacklist"):
-            return 0
-
-        score = 100 * fuzzy_match(phrase.lower(), match["title"].lower(),
-                                  strategy=MatchStrategy.TOKEN_SET_RATIO)
-        return min(100, base_score + score)
-
-    def parse_media_type(self, phrase, media_type):
-        score = 0
-        if self.voc_match(phrase, "reddit"):
-            score += 10
-            phrase = self.remove_voc(phrase, "reddit")
-        if self.voc_match(phrase, "movies") or \
-                media_type == MediaType.MOVIE:
-            score += 50
-            phrase = self.remove_voc(phrase, "movies")
-        return score, phrase
 
     @ocp_search()
     def search_reddit(self, phrase, media_type):
-        base_score, phrase = self.parse_media_type(phrase, media_type)
-        # search cached documentary database (updated hourly)
-        for v in self.reddit.get_cached_entries():
-            score = self.calc_score(phrase, v, base_score=base_score)
-            if score < 20:
-                continue
-            # return as a video result (single track dict)
-            yield {
-                "match_confidence": score,
-                "media_type": MediaType.MOVIE,
-                #  "length": v.length * 1000,
-                "uri": "youtube//" + v["url"],
-                "playback": PlaybackType.VIDEO,
-                "image": v.get("thumbnail") or self.skill_icon,
-                "bg_image": v.get("thumbnail") or self.skill_icon,
-                "skill_icon": self.skill_icon,
-                "title": v["title"],
-                "skill_id": self.skill_id
-            }
+        base_score = 15 if media_type == MediaType.MOVIE else 0
+        entities = self.ocp_voc_match(phrase)
+
+        title = entities.get("movie_name")
+        skill = "movie_streaming_provider" in entities  # skill matched
+
+        base_score += 30 * len(entities)
+        if title:
+            base_score += 30
+            # search cached database (updated hourly)
+            for v in self.reddit.get_cached_entries():
+                if title.lower() in v["title"].lower():
+
+                    # return as a video result (single track dict)
+                    yield {
+                        "match_confidence": base_score,
+                        "media_type": MediaType.MOVIE,
+                        #  "length": v.length * 1000,
+                        "uri": "youtube//" + v["url"],
+                        "playback": PlaybackType.VIDEO,
+                        "image": v.get("thumbnail") or self.skill_icon,
+                        "bg_image": v.get("thumbnail") or self.skill_icon,
+                        "skill_icon": self.skill_icon,
+                        "title": v["title"],
+                        "skill_id": self.skill_id
+                    }
+        if skill:
+            yield self.get_playlist()
+
+    def get_playlist(self, score=50, num_entries=25):
+        pl = self.featured_media()[:num_entries]
+        return {
+            "match_confidence": score,
+            "media_type": MediaType.MOVIE,
+            "playlist": pl,
+            "playback": PlaybackType.VIDEO,
+            "skill_icon": self.skill_icon,
+            "image": self.skill_icon,
+            "title": "Reddit Movies (Movie Playlist)",
+            "author": "Reddit"
+        }
 
     @ocp_featured_media()
     def featured_media(self):
@@ -97,5 +112,10 @@ class RedditMoviesSkill(OVOSCommonPlaybackSkill):
         } for v in self.reddit.get_cached_entries()]
 
 
-def create_skill():
-    return RedditMoviesSkill()
+if __name__ == "__main__":
+    from ovos_utils.messagebus import FakeBus
+
+    s = RedditMoviesSkill(bus=FakeBus(), skill_id="t.fake")
+    for r in s.search_reddit("BLACULA", MediaType.MOVIE):
+        print(r)
+        # {'match_confidence': 75, 'media_type': <MediaType.MOVIE: 10>, 'uri': 'youtube//https://www.youtube.com/watch?v=jlst21ThZrU', 'playback': <PlaybackType.VIDEO: 1>, 'image': 'https://github.com/OpenVoiceOS/ovos-ocp-audio-plugin/raw/master/ovos_plugin_common_play/ocp/res/ui/images/ocp.png', 'bg_image': 'https://github.com/OpenVoiceOS/ovos-ocp-audio-plugin/raw/master/ovos_plugin_common_play/ocp/res/ui/images/ocp.png', 'skill_icon': 'https://github.com/OpenVoiceOS/ovos-ocp-audio-plugin/raw/master/ovos_plugin_common_play/ocp/res/ui/images/ocp.png', 'title': '"BLACULA" (1972)', 'skill_id': 't.fake'}
